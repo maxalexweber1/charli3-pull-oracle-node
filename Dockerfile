@@ -1,15 +1,23 @@
-FROM python:3.10.4-slim-buster
+FROM python:3.11-slim
 
-RUN pip install poetry
+# `git` is required at build time for poetry to resolve the git-pinned
+# charli3_offchain_core dependency (our c3-supply/multi-aggstate SDK fork).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir poetry
 
 WORKDIR /app
-
 RUN poetry config virtualenvs.create false
 
-COPY pyproject.toml poetry.lock ./
-
+# poetry.lock from upstream does not reflect our git-pinned SDK fork; let
+# poetry re-resolve against the current pyproject instead.
+COPY pyproject.toml ./
 COPY node/ /app/node/
 
 RUN poetry install --no-interaction --no-ansi --no-root
 
-CMD ["python", "-m", "node.main", "run", "-c", "config.yml"]
+EXPOSE 8000
+
+CMD ["python", "-m", "node.main", "run", "-c", "/config.yml"]
