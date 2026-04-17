@@ -1,0 +1,72 @@
+# Multi-feed node configuration (D-05 fork).
+#
+# One oracle policy, N AggState UTxOs distinguished by asset_name prefix.
+# This example wires a single supplier-a node that updates two feeds:
+#  - inventory (grams available, from ERP)
+#  - price     (lovelace per gram, from ERP)
+#
+# Requires the forked Aiken validator that prefix-matches aggstate token
+# names (c3-supply/asset-prefix branch of charli3-pull-oracle-contracts).
+
+Updater:
+  verbosity: INFO
+  reward_collect_check_interval: 180
+
+Cache:
+  enabled: true
+  ttl: 60
+
+RewardCollection:
+  trigger_amount: 500
+  reward_destination_address: "base"
+  create_collateral: true
+
+Node:
+  mnemonic: "YOUR 24 WORDS HERE"
+  # One policy id + script address for the whole supplier oracle
+  oracle_currency: "REPLACE_WITH_SUPPLIER_A_POLICY_ID"
+  oracle_address: "REPLACE_WITH_SUPPLIER_A_ORACLE_ADDR"
+  reward_token_hash: null
+  reward_token_name: null
+
+  feeds:
+    - feed_id: inventory
+      asset_name: "C3AS_inventory"
+      rate:
+        general_base_symbol: GRAMS-AVAIL
+        base_currency:
+          api_sources:
+            - adapter: generic-api
+              asset_a: grams
+              asset_b: count
+              sources:
+                - name: supplier-a-erp
+                  api_url: http://erp-a:8001/inventory?product_code=LI-CARB-01
+                  json_path: ["available_g"]
+
+    - feed_id: price
+      asset_name: "C3AS_price"
+      rate:
+        general_base_symbol: LOVELACE-PER-GRAM
+        base_currency:
+          api_sources:
+            - adapter: generic-api
+              asset_a: lovelace
+              asset_b: gram
+              sources:
+                - name: supplier-a-erp
+                  api_url: http://erp-a:8001/inventory?product_code=LI-CARB-01
+                  json_path: ["unit_price_lovelace"]
+
+ChainQuery:
+  network: TESTNET
+  ogmios:
+    ws_url: ws://preprod-ogmios:1337
+    kupo_url: http://preprod-kupo:1442
+
+ReferenceScript:
+  # Reference scripts from our forked Charli3 validator deployment.
+  address: "REPLACE_WITH_OUR_REF_SCRIPT_ADDR"
+  utxo_reference:
+    transaction_id: "REPLACE_WITH_REF_SCRIPT_TX_HASH"
+    output_index: 0

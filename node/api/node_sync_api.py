@@ -49,10 +49,19 @@ class NodeSyncApi:
     ) -> Dict[str, Any]:
         """Report feed and node initialization data to the central db."""
         try:
-            # Extract data from your config structure
+            # Multi-feed (D-05): report against the first configured feed.
+            # A future enhancement could POST one initialization entry per
+            # feed, but the current /initialize endpoint assumes one feed
+            # per call.
+            primary_feed = config.node.feeds[0] if config.node.feeds else None
+            symbol = (
+                primary_feed.rate.general_base_symbol
+                if primary_feed is not None
+                else ""
+            )
             feed_data = {
                 "feedAddress": config.node.oracle_address,
-                "symbol": config.rate.general_base_symbol,
+                "symbol": symbol,
                 "aggStateNFT": config.node.oracle_currency,  # Using oracle_currency as NFT
                 "oracleNFT": config.node.oracle_currency,
                 "rewardNFT": config.node.reward_token_hash
@@ -77,20 +86,23 @@ class NodeSyncApi:
                 "feedAddress": config.node.oracle_address,
             }
 
-            # Extract providers from your rate config
+            # Multi-feed (D-05): collect providers across all configured feeds.
             providers_data = []
-            for exchange in config.rate.base_currency.exchanges:
-                for source in exchange.sources:
-                    provider_data = {
-                        "providerId": str(uuid.uuid4()),
-                        "feedAddress": config.node.oracle_address,
-                        "name": source.name,
-                        "apiUrl": source.api_url or "",
-                        "path": "/".join(str(p) for p in (source.json_path or [])),
-                        "token": source.headers.get("Authorization", ""),
-                        "adapterType": exchange.adapter,
-                    }
-                    providers_data.append(provider_data)
+            for feed_cfg in config.node.feeds:
+                for exchange in feed_cfg.rate.base_currency.exchanges:
+                    for source in exchange.sources:
+                        provider_data = {
+                            "providerId": str(uuid.uuid4()),
+                            "feedAddress": config.node.oracle_address,
+                            "name": source.name,
+                            "apiUrl": source.api_url or "",
+                            "path": "/".join(
+                                str(p) for p in (source.json_path or [])
+                            ),
+                            "token": source.headers.get("Authorization", ""),
+                            "adapterType": exchange.adapter,
+                        }
+                        providers_data.append(provider_data)
 
             # Prepare the data payload with exact same format
             data = {

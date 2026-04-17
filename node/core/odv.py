@@ -1,7 +1,12 @@
+import asyncio
 import hashlib
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Any
 
+import aiohttp
 import charli3_offchain_core.oracle.aggregate.builder as odv_builder
 from charli3_offchain_core.blockchain.chain_query import ChainQuery
 from charli3_offchain_core.blockchain.transactions import TransactionManager
@@ -13,6 +18,7 @@ from charli3_offchain_core.models.message import (
     SignedOracleNodeMessage,
 )
 from charli3_offchain_core.models.oracle_datums import Asset, NoDatum, SomeAsset
+from charli3_offchain_core.models.oracle_redeemers import AggregateMessage
 from charli3_offchain_core.oracle.exceptions import (
     AggregationError,
     DataError,
@@ -72,6 +78,7 @@ class OdvService:
         reward_destination_address: str | None = None,
         create_collateral: bool = True,
         ref_script_config: ReferenceScriptConfig | None = None,
+        aggstate_asset_name: str = "C3AS",
     ):
         self.rate_aggregator = rate_aggregator
         self.chain_query = chain_query
@@ -83,6 +90,7 @@ class OdvService:
         self.reward_token_name = reward_token_name
         self.reward_destination_address = reward_destination_address
         self.create_collateral = create_collateral
+        self.aggstate_asset_name = aggstate_asset_name
         self.node_feed_sk = node_feed_sk
         self.node_feed_vk = node_feed_vk
         self.node_feed_vkh = node_feed_vkh
@@ -109,6 +117,7 @@ class OdvService:
             reward_token_hash=self.reward_token_policy_hash,
             reward_token_name=self.reward_token_asset_name,
             ref_script_config=ref_script_config,
+            aggstate_asset_name=aggstate_asset_name,
         )
 
     async def handle_feed_request(
@@ -223,6 +232,107 @@ class OdvService:
             logger.error(f"Aggregation sign request failed: {str(e)}")
             raise
 
+    async def handle_aggregate_request(
+        self,
+        oracle_nft_policy_id: str,
+        peer_urls: list[str],
+        tx_validity_interval: TxValidityInterval,
+    ) -> dict[str, Any]:
+        """Coordinator-mode ODV orchestration (D-05).
+
+        The node running this method is the coordinator for one aggregation
+        round of one feed. It:
+          1. Produces its own signed feed message locally.
+          2. Fans /odv/feed/{feed_id} to peer nodes in parallel.
+          3. Builds an `AggregateMessage` sorted by (feed_value, vkh).
+          4. Builds the aggregation Tx via `OracleTransactionBuilder` with
+             `aggstate_asset_name` = `self.aggstate_asset_name` (which the
+             gepatcht `state_checks.find_account_pair` uses to pick the
+             right AggState UTxO under the shared policy).
+          5. Signs the Tx with the coordinator's payment key AND all node
+             feed signing keys it can load from `COORDINATOR_KEYS_DIR`
+             (plus its own key).
+          6. Submits via tx_manager.sign_and_submit.
+
+        `COORDINATOR_KEYS_DIR` is optional env: if unset, only the
+        coordinator's own node_feed_sk signs — submit will fail the
+        threshold check unless the coordinator happens to be the only
+        signer required.
+        """
+        feed_id = getattr(self, "feed_id", "default")
+
+        # (1) Coordinator's own feed message.
+        self_signed = await self.handle_feed_request(
+            oracle_nft_policy_id, tx_validity_interval
+        )
+
+        # (2) Peer feed messages (parallel, best-effort).
+        peer_signed = await _collect_peer_feed_messages(
+            peer_urls, feed_id, oracle_nft_policy_id, tx_validity_interval
+        )
+        all_signed = [self_signed, *peer_signed]
+
+        # (3) Build AggregateMessage. pycardano returns VerificationKey; hash to VKH.
+        feeds: dict[VerificationKeyHash, int] = {}
+        for sm in all_signed:
+            vkh = sm.verification_key.hash()
+            feeds[vkh] = sm.message.feed
+        # Sort by (feed_value, vkh_bytes) as the core-lib builder expects.
+        sorted_feeds = dict(
+            sorted(feeds.items(), key=lambda kv: (kv[1], kv[0].payload))
+        )
+        aggregate_msg = AggregateMessage(node_feeds_sorted_by_feed=sorted_feeds)
+
+        # (4) Build tx. `OracleTransactionBuilder` was constructed with
+        # `aggstate_asset_name` from this service's feed config (main.py loop).
+        result = await self.odv_tx_builder.build_odv_tx(
+            message=aggregate_msg,
+            signing_key=self.node_payment_sk,
+            change_address=self.node_payment_addr,
+        )
+
+        # (5) Collect signing keys: coordinator's payment key + all available
+        # node feed skeys (coordinator's own + any in COORDINATOR_KEYS_DIR).
+        all_keys: list = [self.node_payment_sk, self.node_feed_sk]
+        extra_keys_dir = os.environ.get("COORDINATOR_KEYS_DIR")
+        if extra_keys_dir:
+            for skey_path in sorted(Path(extra_keys_dir).glob("*.skey")):
+                try:
+                    extra = ExtendedSigningKey.load(str(skey_path))
+                except Exception:
+                    try:
+                        extra = PaymentExtendedSigningKey.load(str(skey_path))
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to load %s: %s", skey_path, e
+                        )
+                        continue
+                # Skip our own feed key (already in list).
+                try:
+                    if extra.to_verification_key().hash() == self.node_feed_vkh:
+                        continue
+                except Exception:
+                    pass
+                all_keys.append(extra)
+
+        # (6) Sign + submit. wait_confirmation=False so this endpoint returns
+        # quickly; the caller polls the chain (via bridge /feeds) for
+        # confirmation.
+        status, _submitted = await self.tx_manager.sign_and_submit(
+            result.transaction, all_keys, wait_confirmation=False
+        )
+
+        feed_values = sorted(sorted_feeds.values())
+        median = feed_values[len(feed_values) // 2] if feed_values else 0
+
+        return {
+            "tx_hash": str(result.transaction.id),
+            "feed_value": median,
+            "timestamp_ms": int(time.time() * 1000),
+            "peers_responded": len(peer_signed),
+            "status": status,
+        }
+
     async def attempt_node_collect(self, contract_utxos: list | None = None) -> None:
         """
         Build node collect tx and attempt submitting it,
@@ -305,3 +415,47 @@ class OdvService:
 
         except Exception as e:
             logger.error(f"Node collect failed: {e}", exc_info=e)
+
+
+async def _collect_peer_feed_messages(
+    peer_urls: list[str],
+    feed_id: str,
+    oracle_nft_policy_id: str,
+    tx_validity_interval: TxValidityInterval,
+) -> list[SignedOracleNodeMessage]:
+    """Fan out /odv/feed/{feed_id} to peer nodes in parallel.
+
+    Peer errors are swallowed (logged). Caller is responsible for the
+    threshold check; this function only returns what it successfully got.
+    """
+    if not peer_urls:
+        return []
+
+    payload = {
+        "oracle_nft_policy_id": oracle_nft_policy_id,
+        "tx_validity_interval": tx_validity_interval.model_dump(),
+    }
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    async def fetch_one(url: str) -> SignedOracleNodeMessage | None:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{url.rstrip('/')}/odv/feed/{feed_id}", json=payload
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "Peer %s /odv/feed/%s returned %s",
+                            url, feed_id, resp.status,
+                        )
+                        return None
+                    data = await resp.json()
+                    return SignedOracleNodeMessage.model_validate(data)
+        except Exception as e:
+            logger.warning("Peer %s unreachable: %s", url, e)
+            return None
+
+    results = await asyncio.gather(
+        *[fetch_one(u) for u in peer_urls], return_exceptions=False
+    )
+    return [r for r in results if r is not None]

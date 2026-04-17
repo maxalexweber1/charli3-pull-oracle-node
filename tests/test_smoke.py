@@ -4,6 +4,7 @@ from node.config.models import (
     AppConfig,
     ChainQueryConfig,
     CurrencyConfig,
+    FeedConfig,
     NodeConfig,
     RateConfig,
     RewardCollectionConfig,
@@ -17,19 +18,23 @@ def test_create_app_with_mock_config():
     Test that create_app successfully initializes the FastAPI application
     given a valid (mocked) AppConfig.
     """
-    mock_node_config = NodeConfig(
-        mnemonic="test mnemonic",
-        oracle_currency="test_currency",
-        oracle_address="test_address",
-    )
-
     mock_rate_config = RateConfig(
         general_base_symbol="ADA-USD", base_currency=CurrencyConfig(exchanges=[])
     )
 
+    mock_node_config = NodeConfig(
+        mnemonic="test mnemonic",
+        oracle_currency="test_currency",
+        oracle_address="test_address",
+        feeds=[
+            FeedConfig(
+                feed_id="default", asset_name="C3AS", rate=mock_rate_config,
+            ),
+        ],
+    )
+
     mock_config = AppConfig(
         node=mock_node_config,
-        rate=mock_rate_config,
         updater=UpdaterConfig(),
         chain_query=ChainQueryConfig(network="mainnet"),
         reward_collection=RewardCollectionConfig(

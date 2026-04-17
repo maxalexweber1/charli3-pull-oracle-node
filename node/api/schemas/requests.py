@@ -27,3 +27,22 @@ class NodeAggregationSignRequest(BaseModel):
         ..., description="Participating node messages"
     )
     tx_body_cbor: str = Field(..., description="Transaction Body CBOR hex")
+
+
+class OdvAggregateRequest(BaseModel):
+    """Orchestrator request (D-05): coordinator node fans out to peer nodes,
+    collects signed feed messages, builds the aggregation Tx, signs with all
+    node feed keys, and submits.
+    """
+
+    oracle_nft_policy_id: str = Field(..., description="Oracle NFT policy ID")
+    peer_urls: list[str] = Field(
+        default_factory=list,
+        description=(
+            "HTTP base URLs of peer nodes (each exposing /odv/feed/{feed_id}). "
+            "The coordinator's own feed is fetched locally — do not include it here."
+        ),
+    )
+    tx_validity_interval: TxValidityInterval = Field(
+        ..., description="Validity interval for the ODV aggregation round"
+    )

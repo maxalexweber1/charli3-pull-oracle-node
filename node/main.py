@@ -8,7 +8,7 @@ import click
 import uvicorn
 from fastapi import FastAPI
 
-from node.api.dependencies import initialize_odv_service
+from node.api.dependencies import register_odv_service
 from node.api.endpoints import health, odv
 from node.background_tasks import periodic_node_collect
 from node.config.models import AppConfig
@@ -21,6 +21,7 @@ from node.config.setup import (
     setup_node_sync,
 )
 from node.core.aggregator import RateAggregator
+from node.core.odv import OdvService
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +41,6 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("Failed to setup Dendrite backend")
         await asyncio.sleep(1)
 
-        # Initialize core components
-        rate_aggregator = RateAggregator.from_config(
-            config=config.rate, cache_config=config.cache
-        )
-
         node_keys = load_keys(config)
         (
             node_feed_sk,
@@ -59,37 +55,61 @@ async def lifespan(app: FastAPI):
 
         node_sync_api = setup_node_sync(config, node_keys)
 
-        # Initialize ODV service
-        odv_service = await initialize_odv_service(
-            rate_aggregator=rate_aggregator,
-            chain_query=chain_query,
-            tx_manager=tx_manager,
-            oracle_addr=config.node.oracle_address,
-            oracle_curr=config.node.oracle_currency,
-            node_feed_sk=node_feed_sk,
-            node_feed_vk=node_feed_vk,
-            node_feed_vkh=node_feed_vkh,
-            node_payment_sk=node_payment_sk,
-            node_payment_vk=node_payment_vk,
-            reward_token_hash=config.node.reward_token_hash,
-            reward_token_name=config.node.reward_token_name,
-            reward_destination_address=config.reward_collection.reward_destination_address,
-            create_collateral=config.reward_collection.create_collateral,
-            ref_script_config=config.reference_script,
-        )
+        # Multi-feed (D-05): one OdvService + RateAggregator per configured
+        # feed, shared oracle policy + address + keys. Dispatcher keyed by
+        # `feed_id` in api.dependencies.
+        if not config.node.feeds:
+            raise RuntimeError(
+                "node.feeds is empty — configure at least one feed "
+                "(or leave the legacy `Rate:` block for a single default feed)"
+            )
 
-        if node_sync_api:
-            odv_service.node_sync_api = node_sync_api
+        services: dict[str, OdvService] = {}
+        for feed_cfg in config.node.feeds:
+            rate_aggregator = RateAggregator.from_config(
+                config=feed_cfg.rate, cache_config=config.cache
+            )
+            service = OdvService(
+                rate_aggregator=rate_aggregator,
+                chain_query=chain_query,
+                tx_manager=tx_manager,
+                oracle_addr=config.node.oracle_address,
+                oracle_curr=config.node.oracle_currency,
+                node_feed_sk=node_feed_sk,
+                node_feed_vk=node_feed_vk,
+                node_feed_vkh=node_feed_vkh,
+                node_payment_sk=node_payment_sk,
+                node_payment_vk=node_payment_vk,
+                reward_token_hash=config.node.reward_token_hash,
+                reward_token_name=config.node.reward_token_name,
+                reward_destination_address=config.reward_collection.reward_destination_address,
+                create_collateral=config.reward_collection.create_collateral,
+                ref_script_config=config.reference_script,
+                # D-05: targets the specific AggState UTxO of this feed when
+                # the patched charli3_offchain_core is installed. Empty/default
+                # "C3AS" falls back to vanilla single-feed lookup.
+                aggstate_asset_name=feed_cfg.asset_name or "C3AS",
+            )
+            service.feed_id = feed_cfg.feed_id
+            if node_sync_api:
+                service.node_sync_api = node_sync_api
+            services[feed_cfg.feed_id] = service
+            logger.info(
+                f"Registered feed '{feed_cfg.feed_id}' "
+                f"(asset_name='{feed_cfg.asset_name}')"
+            )
+
+        register_odv_service(services)
 
         # Initialize NodeSync (report initialization)
         await initialize_node_sync(config, node_keys, node_sync_api)
-        # Initialize background tasks
+        # Initialize background tasks — one periodic node-collect per feed
         lock_for_node_collect = asyncio.Lock()
         loop = asyncio.get_event_loop()
         node_collect_task = loop.create_task(
             periodic_node_collect(
                 config,
-                odv_service,
+                list(services.values()),
                 lock_for_node_collect,
             )
         )

@@ -8,14 +8,55 @@ from charli3_offchain_core.cli.config.reference_script import (
 
 
 @dataclass
+class FeedConfig:
+    """Per-feed configuration for a multi-feed oracle deployment (D-05).
+
+    Each AggState UTxO under the shared oracle policy carries a distinct
+    `asset_name` (e.g. "C3AS_inventory", "C3AS_price") — our forked
+    Charli3 validator accepts any name sharing the `aggstate_token_name`
+    prefix. The node runs one `RateAggregator` + `OdvService` per feed,
+    dispatched at the HTTP layer by `feed_id`.
+    """
+
+    feed_id: str
+    asset_name: str
+    rate: "RateConfig"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FeedConfig":
+        return cls(
+            feed_id=data["feed_id"],
+            asset_name=data["asset_name"],
+            rate=RateConfig.from_dict(data.get("rate", {})),
+        )
+
+
+@dataclass
 class NodeConfig:
-    """Node configuration."""
+    """Node configuration.
+
+    `oracle_currency` and `oracle_address` are per-oracle (one policy + one
+    script address shared across all feeds of this node). Per-feed config
+    lives in `feeds`.
+    """
 
     mnemonic: str
     oracle_currency: str
     oracle_address: str
+    feeds: list[FeedConfig] = field(default_factory=list)
     reward_token_hash: str | None = None
     reward_token_name: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NodeConfig":
+        return cls(
+            mnemonic=data["mnemonic"],
+            oracle_currency=data["oracle_currency"],
+            oracle_address=data["oracle_address"],
+            feeds=[FeedConfig.from_dict(f) for f in data.get("feeds", [])],
+            reward_token_hash=data.get("reward_token_hash"),
+            reward_token_name=data.get("reward_token_name"),
+        )
 
 
 @dataclass
@@ -176,10 +217,16 @@ class NodeSyncConfig:
 
 @dataclass
 class AppConfig:
-    """Complete application configuration."""
+    """Complete application configuration.
+
+    Multi-feed (D-05): `node.feeds` carries N feeds per oracle. Legacy
+    single-feed configs with top-level `Rate:` are auto-migrated into one
+    synthetic feed (feed_id="default", asset_name=""). Pass the synthetic
+    asset_name down to OdvService only if the core-lib builder is patched
+    to use it; otherwise the legacy exact-name lookup still applies.
+    """
 
     node: NodeConfig
-    rate: RateConfig
     updater: UpdaterConfig
     chain_query: ChainQueryConfig
     reward_collection: RewardCollectionConfig
@@ -190,15 +237,24 @@ class AppConfig:
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> "AppConfig":
         """Create AppConfig from dictionary."""
+        node_dict = dict(config.get("Node", {}))
+        # Legacy single-feed fallback: synthesize one feed from top-level Rate:
+        if not node_dict.get("feeds") and config.get("Rate"):
+            node_dict["feeds"] = [
+                {
+                    "feed_id": "default",
+                    "asset_name": "",
+                    "rate": config["Rate"],
+                }
+            ]
         return cls(
-            node=NodeConfig(**config.get("Node", {})),
-            rate=RateConfig.from_dict(config.get("Rate", {})),
+            node=NodeConfig.from_dict(node_dict),
             updater=UpdaterConfig(**config.get("Updater", {})),
             chain_query=ChainQueryConfig(**config.get("ChainQuery", {})),
             reward_collection=RewardCollectionConfig(
                 **config.get("RewardCollection", {})
             ),
-            cache=CacheConfig(**config.get("Cache", {}) if config.get("Cache") else {}),
+            cache=CacheConfig(**(config.get("Cache") or {})),
             node_sync=(
                 NodeSyncConfig(**config.get("NodeSync", {}))
                 if config.get("NodeSync")

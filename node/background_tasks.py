@@ -15,14 +15,18 @@ logger = logging.getLogger(__name__)
 
 async def periodic_node_collect(
     config: AppConfig,
-    odv_service: OdvService,
+    odv_services: list[OdvService],
     lock_for_node_collect: asyncio.Lock,
 ) -> NoReturn:
-    """
-    Run node collect handler indefinitely.
+    """Run node collect handler indefinitely across all registered feeds.
+
+    Multi-feed (D-05): loops over every OdvService each cycle since reward
+    accounts and oracle settings are shared across feeds under one policy.
+    A single reward-check per tick covers all feeds.
     """
     logger.info(
-        f"Starting periodic_node_collect with check interval {config.updater.reward_collect_check_interval:.4f} seconds."
+        f"Starting periodic_node_collect over {len(odv_services)} feed(s) with "
+        f"check interval {config.updater.reward_collect_check_interval:.4f} seconds."
     )
     time_elapsed = float(0)
 
@@ -31,27 +35,30 @@ async def periodic_node_collect(
         wait_time = max(config.updater.reward_collect_check_interval - time_elapsed, 0)
 
         time_elapsed = await run_node_collect_handler(
-            config, odv_service, lock_for_node_collect, wait_time
+            config, odv_services, lock_for_node_collect, wait_time
         )
 
 
 async def run_node_collect_handler(
     config: AppConfig,
-    odv_service: OdvService,
+    odv_services: list[OdvService],
     lock_for_node_collect: asyncio.Lock,
     node_collect_delay: float | None = None,  # seconds
 ) -> float:
     """
-    1. Wait some time interval (if any) to acquire the lock for handling the node collect;
-    2. Check and attempt node collect
-    3. Return elapsed time
+    1. Wait some time interval (if any) to acquire the lock;
+    2. Check and attempt node collect for each feed's service;
+    3. Return elapsed time.
     """
     if node_collect_delay:
         await asyncio.sleep(node_collect_delay)
 
     start_time = time.time()
     async with lock_for_node_collect:
-        await check_and_attempt_node_collect(config.reward_collection, odv_service)
+        for odv_service in odv_services:
+            await check_and_attempt_node_collect(
+                config.reward_collection, odv_service
+            )
 
     time_elapsed = time.time() - start_time
     return time_elapsed
