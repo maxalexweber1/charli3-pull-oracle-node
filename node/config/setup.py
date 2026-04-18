@@ -6,6 +6,7 @@ from typing import Optional
 
 import click
 import yaml
+from node.utils.config import load_yaml_config
 from charli3_dendrite.backend import set_backend
 from charli3_dendrite.backend.blockfrost import BlockFrostBackend
 from charli3_dendrite.backend.ogmios_kupo import OgmiosKupoBackend
@@ -33,15 +34,25 @@ def setup_dendrite_backend(config):
     """Setup the backend based on the provided configuration."""
     # Extract chain configuration (blockfrost or ogmios)
     chain_query_config = config.chain_query
-    external_config = chain_query_config.external
+    external_config = chain_query_config.external or {}
 
     network = chain_query_config.network.lower()
 
     # Set the backend based on the network type (mainnet or testnet)
-    if network == "testnet":
-        # Handle testnet-specific setup
-        blockfrost_config = external_config.get("blockfrost", {})
-        blockfrost_id = blockfrost_config.get("project_id")
+    # Preprod + Preview both use the same Network.TESTNET pycardano binding.
+    if network in ("testnet", "preprod", "preview"):
+        # Prefer top-level blockfrost config (matches our supplier-X.yml shape);
+        # fall back to nested `external.blockfrost` for upstream compatibility.
+        # ChainQueryConfig.blockfrost is `Optional[BlockfrostConfig]` but
+        # when the YAML loader passes the raw dict through `**ChainQuery`,
+        # it stays a dict — handle both shapes.
+        bf = chain_query_config.blockfrost
+        if isinstance(bf, dict):
+            blockfrost_id = bf.get("project_id")
+        elif bf is not None:
+            blockfrost_id = bf.project_id
+        else:
+            blockfrost_id = external_config.get("blockfrost", {}).get("project_id")
 
         external_ogmios_config = external_config.get("ogmios", {})
         external_ws_url = external_ogmios_config.get("ws_url")
@@ -62,7 +73,7 @@ def setup_dendrite_backend(config):
             logger.warning("Blockfrost backend configured for Testnet.")
         else:
             logger.error(
-                "❌ Missing external Ogmios or Blockfrost configuration for Testnet."
+                "Missing Ogmios or Blockfrost configuration for Testnet."
             )
             return False
     else:
@@ -98,17 +109,34 @@ def setup_blockfrost_context(
         Optional[BlockFrostChainContext]: Configured BlockFrost context or None.
     """
     blockfrost_config = config.chain_query.blockfrost
-
-    if blockfrost_config and blockfrost_config.project_id:
-        os.environ["PROJECT_ID"] = blockfrost_config.project_id
-
-        return BlockFrostChainContext(
-            blockfrost_config.project_id,
-            network,
-            base_url=blockfrost_config.base_url or "",
+    if isinstance(blockfrost_config, dict):
+        project_id = blockfrost_config.get("project_id")
+        base_url = blockfrost_config.get("base_url") or blockfrost_config.get("api_url")
+    elif blockfrost_config is not None:
+        project_id = blockfrost_config.project_id
+        base_url = getattr(blockfrost_config, "base_url", None) or getattr(
+            blockfrost_config, "api_url", None
         )
+    else:
+        return None
 
-    return None
+    if not project_id:
+        return None
+
+    os.environ["PROJECT_ID"] = project_id
+
+    # When base_url is missing we leave it to BlockFrostChainContext to pick
+    # the right one from the project_id prefix (matches our monkey-patch).
+    if not base_url:
+        from blockfrost import ApiUrls
+        if project_id.startswith("preprod"):
+            base_url = ApiUrls.preprod.value
+        elif project_id.startswith("preview"):
+            base_url = ApiUrls.preview.value
+        else:
+            base_url = ApiUrls.mainnet.value
+
+    return BlockFrostChainContext(project_id, network, base_url=base_url)
 
 
 def setup_ogmios_context(
@@ -152,10 +180,13 @@ def setup_ogmios_context(
 def setup_network(config) -> Network:
     """Setup the network based on the specified configuration."""
     network_config = config.chain_query
+    cfg_network = (network_config.network or "").upper()
     network = (
-        Network.TESTNET if network_config.network == "TESTNET" else Network.MAINNET
+        Network.TESTNET
+        if cfg_network in ("TESTNET", "PREPROD", "PREVIEW")
+        else Network.MAINNET
     )
-    os.environ["NETWORK"] = "preprod" if network == Network.TESTNET else "mainnet"
+    os.environ["NETWORK"] = cfg_network.lower() if network == Network.TESTNET else "mainnet"
     return network
 
 
@@ -249,16 +280,21 @@ def setup_logging(config: dict) -> logging.Logger:
 
 
 def load_config(config_path: str) -> AppConfig:
-    """Load and validate application configuration."""
+    """Load and validate application configuration.
+
+    Uses load_yaml_config so that <%= VAR %> placeholders inside the YAML
+    are resolved from the process environment at startup. Without this,
+    docker-compose `environment:` overrides for MNEMONIC / BLOCKFROST_PROJECT_ID
+    etc. cannot reach the config dataclasses.
+    """
     try:
         config_file = Path(config_path)
         if not config_file.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
-        with open(config_file) as f:
-            config_dict = yaml.safe_load(f)
-            if not config_dict:
-                raise ValueError("Empty configuration file")
+        config_dict = load_yaml_config(config_file)
+        if not config_dict:
+            raise ValueError("Empty configuration file")
 
         setup_logging(config_dict)
         welcome_message()

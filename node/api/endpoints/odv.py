@@ -79,6 +79,22 @@ async def aggregate(
                 "error_type": e.__class__.__name__,
             },
         )
+    except Exception as e:
+        # SDK raises StateValidationError / TransactionError / TransactionBuildError
+        # which don't subclass NodeServiceError. Without this catch they bubble
+        # to FastAPI as a generic 500 ("Internal Server Error" body) and the
+        # bridge can't tell apart "AggState still fresh" from real failures.
+        msg = str(e)
+        is_not_yet_expired = "No valid agg state UTxO found" in msg
+        return JSONResponse(
+            status_code=409 if is_not_yet_expired else 500,
+            content={
+                "detail": msg[:500],
+                "error_type": e.__class__.__name__,
+                "feed_id": feed_id,
+                "not_yet_expired": is_not_yet_expired,
+            },
+        )
 
 
 @router.post("/sign/{feed_id}", response_model=NodeAggregationSignResponse)
