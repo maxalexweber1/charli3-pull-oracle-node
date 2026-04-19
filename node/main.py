@@ -2,11 +2,14 @@
 
 import asyncio
 import logging
+import traceback
 from contextlib import asynccontextmanager
 
 import click
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from node.api.dependencies import register_odv_service
 from node.api.endpoints import health, odv
@@ -148,6 +151,33 @@ def create_app(config: AppConfig) -> FastAPI:
     # Register routers
     app.include_router(odv.router, prefix="/odv", tags=["odv"])
     app.include_router(health.router, tags=["health"])
+
+    # c3-supply debug: FastAPI's default exception handler swallows the stack
+    # trace and replies with a plain 500. That makes it impossible to diagnose
+    # coordinator crashes (e.g. the tx-chaining `reward_account_utxo_override`
+    # path). Log the full traceback on any unhandled exception, then fall back
+    # to the same 500 shape.
+    @app.exception_handler(Exception)
+    async def _log_unhandled(request: Request, exc: Exception) -> JSONResponse:
+        # Let HTTPException pass through unchanged (FastAPI handles it natively
+        # and those are expected control flow, not bugs).
+        if isinstance(exc, StarletteHTTPException):
+            raise exc
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.error(
+            "Unhandled %s on %s %s\n%s",
+            type(exc).__name__,
+            request.method,
+            request.url.path,
+            tb,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"{type(exc).__name__}: {exc}",
+                "path": request.url.path,
+            },
+        )
 
     return app
 
