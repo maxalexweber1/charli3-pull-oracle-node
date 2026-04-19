@@ -46,23 +46,100 @@ if _saved_pid is not None:
 #    /utils/txs/evaluate collapses empty ScriptFailures into Namespace()
 #    which hides real Plutus errors AND fails our valid txs upstream.
 #    This is the same workaround as scripts/odv-first-round.py:48-109.
+#
+#    Tx-chaining: when the SDK builds a tx that spends a not-yet-confirmed
+#    UTxO (e.g. a C3RA output chained from a previous aggregation), the
+#    script context on Ogmios's current ledger state can't resolve that
+#    input and the evaluate fails with code 3010. The SDK registers the
+#    chained UTxO thread-local via `charli3_offchain_core._chained_utxos`
+#    so we can forward it here as `additionalUtxo`.
 import json as _json  # noqa: E402
+import logging as _logging  # noqa: E402
 import urllib.request  # noqa: E402
 
 from pycardano import ExecutionUnits  # noqa: E402
 from pycardano.backend import blockfrost as _pbf  # noqa: E402
 
 _OGMIOS_URL = os.environ.get("OGMIOS_URL", "http://35.209.192.203:1337").rstrip("/")
+_ogmios_log = _logging.getLogger(__name__)
 
 
-def _ogmios_evaluate(self, cbor):
-    """Replace BlockFrostChainContext.evaluate_tx_cbor with an Ogmios JSON-RPC call."""
+def _utxo_to_ogmios_additional_utxo(utxo):
+    """Convert a pycardano UTxO to Ogmios v6 additionalUtxo entry.
+
+    Ogmios v6 Utxo schema: flat objects with transaction+index+address+value+
+    optional datum/datumHash/script — NOT [input, output] tuples (that was v5).
+    """
+    out = utxo.output
+    value = {"ada": {"lovelace": int(out.amount.coin)}}
+    if out.amount.multi_asset:
+        for policy, assets in out.amount.multi_asset.data.items():
+            policy_hex = policy.payload.hex() if hasattr(policy, "payload") else bytes(policy).hex()
+            asset_map = {}
+            for asset, count in assets.data.items():
+                asset_hex = asset.payload.hex() if hasattr(asset, "payload") else bytes(asset).hex()
+                asset_map[asset_hex] = int(count)
+            if asset_map:
+                value[policy_hex] = asset_map
+
+    # pycardano TransactionId: prefer .payload (raw bytes) → hex. str() returns
+    # a Python repr ("TransactionId(hex='…')") which Ogmios can't parse.
+    tx_id = utxo.input.transaction_id
+    if hasattr(tx_id, "payload"):
+        tx_id_hex = tx_id.payload.hex()
+    else:
+        tx_id_hex = bytes(tx_id).hex()
+
+    entry = {
+        "transaction": {"id": tx_id_hex},
+        "index": int(utxo.input.index),
+        "address": str(out.address),
+        "value": value,
+    }
+    if out.datum is not None:
+        try:
+            datum_cbor = out.datum.to_cbor().hex() if hasattr(out.datum, "to_cbor") else bytes(out.datum).hex()
+            entry["datum"] = datum_cbor
+        except Exception as e:
+            _ogmios_log.warning("Failed to serialize datum for additionalUtxo: %s", e)
+    return entry
+
+
+def _ogmios_evaluate(self, cbor, additional_utxos=None):
+    """Replace BlockFrostChainContext.evaluate_tx_cbor with an Ogmios JSON-RPC call.
+
+    Accepts both the pycardano-passed `additional_utxos` kwarg and pulls in
+    any thread-local chained UTxOs registered by the SDK, so script-context
+    resolution covers virtual (unconfirmed) inputs.
+    """
     cbor_hex = cbor.hex() if isinstance(cbor, (bytes, bytearray)) else cbor
+
+    # Merge explicit kwarg with SDK thread-local registration.
+    try:
+        from charli3_offchain_core import _chained_utxos  # noqa: WPS433
+        registered = _chained_utxos.get_current()
+    except Exception:
+        registered = []
+    merged = list(additional_utxos or []) + list(registered or [])
+
+    params: dict = {"transaction": {"cbor": cbor_hex}}
+    if merged:
+        try:
+            params["additionalUtxo"] = [
+                _utxo_to_ogmios_additional_utxo(u) for u in merged
+            ]
+            _ogmios_log.info(
+                "Forwarding %d chained UTxO(s) as Ogmios additionalUtxo", len(merged)
+            )
+        except Exception as e:
+            _ogmios_log.warning(
+                "Failed to build additionalUtxo; evaluating without chain context: %s", e
+            )
 
     payload = _json.dumps({
         "jsonrpc": "2.0",
         "method": "evaluateTransaction",
-        "params": {"transaction": {"cbor": cbor_hex}},
+        "params": params,
         "id": "c3-supply-node",
     }).encode("utf-8")
 

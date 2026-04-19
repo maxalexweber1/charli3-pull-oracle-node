@@ -11,7 +11,7 @@ python = ">=3.10,<3.12"
 pycardano = { git = "https://github.com/Charli3-Official/pycardano.git", branch = "fix/odv-multisig-v0.17.0-kupo-additions"}
 # c3-supply fork: multi-aggstate support via aggstate_asset_name kwarg.
 # For local dev against a sibling checkout: use `{ path = "../charli3-pull-oracle-sdk", develop = true }`.
-odv-multisig-charli3-offchain-core = { git = "https://github.com/maxalexweber1/charli3-pull-oracle-sdk.git", branch = "c3-supply/multi-aggstate" }
+odv-multisig-charli3-offchain-core = { path = "./_sdk_local", develop = false }
 charli3-dendrite = {git = "https://github.com/talhahussain7/charli3-dendrite.git", branch = "odv-multisig-v0.17.0-kupo-additions"}
 aiohttp = "^3.8.4"
 python-json-logger = "^2.0.7"

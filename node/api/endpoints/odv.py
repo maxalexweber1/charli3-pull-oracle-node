@@ -64,10 +64,17 @@ async def aggregate(
     submits the aggregation Tx, and returns the resulting tx hash.
     """
     try:
+        override_cbor: tuple[str, str] | None = None
+        if request.reward_account_utxo_override is not None:
+            override_cbor = (
+                request.reward_account_utxo_override.input_cbor,
+                request.reward_account_utxo_override.output_cbor,
+            )
         result = await odv_service.handle_aggregate_request(
             oracle_nft_policy_id=request.oracle_nft_policy_id,
             peer_urls=request.peer_urls,
             tx_validity_interval=request.tx_validity_interval,
+            reward_account_utxo_override_cbor=override_cbor,
         )
         return OdvAggregateResponse(**result)
     except NodeServiceError as e:

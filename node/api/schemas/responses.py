@@ -15,6 +15,13 @@ class NodeAggregationSignResponse(BaseModel):
     signature: str = Field(..., description="Transaction signature hex")
 
 
+class ChainedUtxoRef(BaseModel):
+    """A UTxO transport format for tx-chaining — see request schema."""
+
+    input_cbor: str = Field(..., description="TransactionInput CBOR hex")
+    output_cbor: str = Field(..., description="TransactionOutput CBOR hex")
+
+
 class OdvAggregateResponse(BaseModel):
     """Coordinator response from /odv/aggregate/{feed_id}."""
 
@@ -23,3 +30,12 @@ class OdvAggregateResponse(BaseModel):
     timestamp_ms: int = Field(..., description="Creation timestamp in ms")
     peers_responded: int = Field(..., description="Peer nodes that returned a signed feed message")
     status: str = Field(default="submitted", description="Submission status")
+    new_reward_account_utxo: ChainedUtxoRef | None = Field(
+        default=None,
+        description=(
+            "The new RewardAccount (C3RA) UTxO produced by this submission. "
+            "Caller should pass this as `reward_account_utxo_override` in the "
+            "next back-to-back aggregation for the same policy to avoid the "
+            "shared-C3RA race."
+        ),
+    )

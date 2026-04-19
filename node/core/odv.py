@@ -17,7 +17,12 @@ from charli3_offchain_core.models.message import (
     OracleNodeMessage,
     SignedOracleNodeMessage,
 )
-from charli3_offchain_core.models.oracle_datums import Asset, NoDatum, SomeAsset
+from charli3_offchain_core.models.oracle_datums import (
+    Asset,
+    NoDatum,
+    RewardAccountVariant,
+    SomeAsset,
+)
 from charli3_offchain_core.models.oracle_redeemers import AggregateMessage
 from charli3_offchain_core.oracle.exceptions import (
     AggregationError,
@@ -46,7 +51,10 @@ from pycardano import (
     ScriptHash,
     Transaction,
     TransactionBody,
+    TransactionInput,
+    TransactionOutput,
     TransactionWitnessSet,
+    UTxO,
     VerificationKey,
     VerificationKeyHash,
 )
@@ -237,6 +245,7 @@ class OdvService:
         oracle_nft_policy_id: str,
         peer_urls: list[str],
         tx_validity_interval: TxValidityInterval,
+        reward_account_utxo_override_cbor: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Coordinator-mode ODV orchestration (D-05).
 
@@ -285,10 +294,50 @@ class OdvService:
 
         # (4) Build tx. `OracleTransactionBuilder` was constructed with
         # `aggstate_asset_name` from this service's feed config (main.py loop).
+        # If a tx-chaining override was passed in, decode the UTxO and use it
+        # instead of the on-chain RewardAccount lookup — lets this tx spend
+        # the new C3RA output of a previous back-to-back aggregation before
+        # that tx is ledger-confirmed.
+        override_utxo: UTxO | None = None
+        if reward_account_utxo_override_cbor is not None:
+            try:
+                inp_hex, out_hex = reward_account_utxo_override_cbor
+                override_utxo = UTxO(
+                    TransactionInput.from_cbor(bytes.fromhex(inp_hex)),
+                    TransactionOutput.from_cbor(bytes.fromhex(out_hex)),
+                )
+                # Re-type the inline datum from RawPlutusData back to
+                # RewardAccountVariant so the SDK's _create_reward_account_output
+                # can call `.datum.nodes_to_rewards` on it. Pycardano's generic
+                # CBOR decoder returns RawPlutusData for any datum without a
+                # registered schema; the SDK expects the typed variant.
+                if override_utxo.output.datum is not None:
+                    try:
+                        raw_datum_cbor = override_utxo.output.datum.to_cbor()
+                        override_utxo.output.datum = RewardAccountVariant.from_cbor(
+                            raw_datum_cbor
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to retype override datum to RewardAccountVariant: %s", e
+                        )
+                logger.info(
+                    "Using chained RewardAccount UTxO override: %s#%d",
+                    override_utxo.input.transaction_id,
+                    override_utxo.input.index,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to decode reward_account_utxo_override_cbor: %s "
+                    "-- falling back to on-chain lookup", e
+                )
+                override_utxo = None
+
         result = await self.odv_tx_builder.build_odv_tx(
             message=aggregate_msg,
             signing_key=self.node_payment_sk,
             change_address=self.node_payment_addr,
+            reward_account_utxo_override=override_utxo,
         )
 
         # (5) Collect signing keys: coordinator's payment key + all available
@@ -325,12 +374,23 @@ class OdvService:
         feed_values = sorted(sorted_feeds.values())
         median = feed_values[len(feed_values) // 2] if feed_values else 0
 
+        new_ra_dict: dict[str, str] | None = None
+        if result.new_reward_account_utxo is not None:
+            try:
+                new_ra_dict = {
+                    "input_cbor": result.new_reward_account_utxo.input.to_cbor().hex(),
+                    "output_cbor": result.new_reward_account_utxo.output.to_cbor().hex(),
+                }
+            except Exception as e:
+                logger.warning("Failed to serialize new RewardAccount UTxO: %s", e)
+
         return {
             "tx_hash": str(result.transaction.id),
             "feed_value": median,
             "timestamp_ms": int(time.time() * 1000),
             "peers_responded": len(peer_signed),
             "status": status,
+            "new_reward_account_utxo": new_ra_dict,
         }
 
     async def attempt_node_collect(self, contract_utxos: list | None = None) -> None:
